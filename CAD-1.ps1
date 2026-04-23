@@ -1,37 +1,35 @@
 <#
 .SYNOPSIS
-    Connects to Azure Government, reads a CSV list of Azure VMs,
-    and reports average and peak CPU utilization for the previous month.
+    Discover all Azure VMs in Azure Government and report previous month's
+    average and peak CPU utilization.
 
 .DESCRIPTION
-    Expected CSV columns:
-        SubscriptionId,ResourceGroupName,VMName
-
-    Example:
-        SubscriptionId,ResourceGroupName,VMName
-        11111111-1111-1111-1111-111111111111,rg-prod-app,vm-app-01
-        22222222-2222-2222-2222-222222222222,rg-prod-db,vm-db-01
-
-    Output:
-        Writes results to screen and exports a CSV file.
+    - Connects to Azure Government
+    - Enumerates all accessible subscriptions
+    - Enumerates all VMs in each subscription
+    - Pulls Azure Monitor "Percentage CPU" for the previous calendar month
+    - Outputs to screen and CSV
 
 .NOTES
-    Requires:
-        Az.Accounts
-        Az.Compute
-        Az.Monitor
+    Required modules:
+      Az.Accounts
+      Az.Compute
+      Az.Monitor
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$ServerListCsv,
-
     [Parameter(Mandatory = $false)]
     [string]$OutputCsv = ".\AzureGov-PreviousMonth-CPUReport.csv",
 
     [Parameter(Mandatory = $false)]
-    [switch]$UseDeviceAuthentication
+    [switch]$UseDeviceAuthentication,
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$SubscriptionId,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeStoppedVMs
 )
 
 Set-StrictMode -Version Latest
@@ -52,7 +50,7 @@ function Get-PreviousMonthWindowUtc {
     $now = Get-Date
     $firstDayOfCurrentMonth = Get-Date -Year $now.Year -Month $now.Month -Day 1 -Hour 0 -Minute 0 -Second 0
     $startLocal = $firstDayOfCurrentMonth.AddMonths(-1)
-    $endLocal = $firstDayOfCurrentMonth.AddSeconds(-1)
+    $endLocal   = $firstDayOfCurrentMonth.AddSeconds(-1)
 
     [PSCustomObject]@{
         StartLocal = $startLocal
@@ -75,14 +73,14 @@ function Get-OverallCpuStats {
         [datetime]$EndTimeUtc
     )
 
-    # 1-hour grain gives a practical balance between fidelity and API volume.
     $metric = Get-AzMetric `
         -ResourceId $ResourceId `
         -MetricName "Percentage CPU" `
         -StartTime $StartTimeUtc `
         -EndTime $EndTimeUtc `
         -TimeGrain 01:00:00 `
-        -DetailedOutput
+        -DetailedOutput `
+        -ErrorAction Stop
 
     if (-not $metric -or -not $metric.Data) {
         return [PSCustomObject]@{
@@ -92,32 +90,32 @@ function Get-OverallCpuStats {
         }
     }
 
-    $avgSamples = @(
+    $avgValues = @(
         $metric.Data |
         Where-Object { $null -ne $_.Average } |
         Select-Object -ExpandProperty Average
     )
 
-    $maxSamples = @(
+    $maxValues = @(
         $metric.Data |
         Where-Object { $null -ne $_.Maximum } |
         Select-Object -ExpandProperty Maximum
     )
 
     $overallAverage = $null
-    if ($avgSamples.Count -gt 0) {
-        $overallAverage = [math]::Round((($avgSamples | Measure-Object -Average).Average), 2)
+    if ($avgValues.Count -gt 0) {
+        $overallAverage = [math]::Round((($avgValues | Measure-Object -Average).Average), 2)
     }
 
     $overallPeak = $null
-    if ($maxSamples.Count -gt 0) {
-        $overallPeak = [math]::Round((($maxSamples | Measure-Object -Maximum).Maximum), 2)
+    if ($maxValues.Count -gt 0) {
+        $overallPeak = [math]::Round((($maxValues | Measure-Object -Maximum).Maximum), 2)
     }
 
     [PSCustomObject]@{
         AverageCpu = $overallAverage
         PeakCpu    = $overallPeak
-        Samples    = [math]::Max($avgSamples.Count, $maxSamples.Count)
+        Samples    = [math]::Max($avgValues.Count, $maxValues.Count)
     }
 }
 
@@ -125,23 +123,6 @@ try {
     Test-RequiredModule -Name "Az.Accounts"
     Test-RequiredModule -Name "Az.Compute"
     Test-RequiredModule -Name "Az.Monitor"
-
-    if (-not (Test-Path -LiteralPath $ServerListCsv)) {
-        throw "Input CSV not found: $ServerListCsv"
-    }
-
-    $servers = Import-Csv -LiteralPath $ServerListCsv
-
-    if (-not $servers -or $servers.Count -eq 0) {
-        throw "The input CSV is empty."
-    }
-
-    $requiredColumns = @("SubscriptionId", "ResourceGroupName", "VMName")
-    foreach ($col in $requiredColumns) {
-        if ($servers[0].PSObject.Properties.Name -notcontains $col) {
-            throw "Input CSV must contain column '$col'."
-        }
-    }
 
     Write-Host "Connecting to Azure Government..." -ForegroundColor Cyan
     if ($UseDeviceAuthentication) {
@@ -157,76 +138,112 @@ try {
     Write-Host ("  Local: {0} through {1}" -f $window.StartLocal, $window.EndLocal)
     Write-Host ("  UTC:   {0} through {1}" -f $window.StartUtc, $window.EndUtc)
 
+    $subscriptions = if ($SubscriptionId -and $SubscriptionId.Count -gt 0) {
+        Get-AzSubscription | Where-Object { $_.Id -in $SubscriptionId }
+    }
+    else {
+        Get-AzSubscription
+    }
+
+    if (-not $subscriptions) {
+        throw "No accessible subscriptions were found."
+    }
+
     $results = New-Object System.Collections.Generic.List[object]
-    $subscriptionCache = @{}
 
-    foreach ($server in $servers) {
-        $subscriptionId = $server.SubscriptionId.Trim()
-        $resourceGroup  = $server.ResourceGroupName.Trim()
-        $vmName         = $server.VMName.Trim()
-
+    foreach ($sub in $subscriptions) {
         Write-Host ""
-        Write-Host "Processing $vmName in $resourceGroup / $subscriptionId ..." -ForegroundColor Yellow
+        Write-Host ("Subscription: {0} ({1})" -f $sub.Name, $sub.Id) -ForegroundColor Yellow
 
-        try {
-            if (-not $subscriptionCache.ContainsKey($subscriptionId)) {
-                Set-AzContext -SubscriptionId $subscriptionId | Out-Null
-                $subscriptionCache[$subscriptionId] = $true
-            }
-            else {
-                Set-AzContext -SubscriptionId $subscriptionId | Out-Null
-            }
+        Set-AzContext -SubscriptionId $sub.Id | Out-Null
 
-            $vm = Get-AzVM -ResourceGroupName $resourceGroup -Name $vmName -Status -ErrorAction Stop
+        $vms = Get-AzVM -Status
 
-            $stats = Get-OverallCpuStats `
-                -ResourceId $vm.Id `
-                -StartTimeUtc $window.StartUtc `
-                -EndTimeUtc $window.EndUtc
-
-            $results.Add([PSCustomObject]@{
-                Month             = $window.Label
-                SubscriptionId    = $subscriptionId
-                ResourceGroupName = $resourceGroup
-                VMName            = $vmName
-                Location          = $vm.Location
-                PowerState        = ($vm.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -ExpandProperty DisplayStatus -First 1)
-                AverageCpuPct     = $stats.AverageCpu
-                PeakCpuPct        = $stats.PeakCpu
-                SampleCount       = $stats.Samples
-                Status            = "OK"
-                Error             = $null
-            })
+        if (-not $vms) {
+            Write-Host "  No VMs found." -ForegroundColor DarkGray
+            continue
         }
-        catch {
-            $results.Add([PSCustomObject]@{
-                Month             = $window.Label
-                SubscriptionId    = $subscriptionId
-                ResourceGroupName = $resourceGroup
-                VMName            = $vmName
-                Location          = $null
-                PowerState        = $null
-                AverageCpuPct     = $null
-                PeakCpuPct        = $null
-                SampleCount       = 0
-                Status            = "Failed"
-                Error             = $_.Exception.Message
-            })
 
-            Write-Warning "Failed to process $vmName: $($_.Exception.Message)"
+        foreach ($vm in $vms) {
+            $powerState = ($vm.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -ExpandProperty DisplayStatus -First 1)
+
+            if (-not $IncludeStoppedVMs -and $powerState -ne "VM running") {
+                Write-Host ("  Skipping {0} ({1})" -f $vm.Name, $powerState) -ForegroundColor DarkGray
+
+                $results.Add([PSCustomObject]@{
+                    Month             = $window.Label
+                    SubscriptionName  = $sub.Name
+                    SubscriptionId    = $sub.Id
+                    ResourceGroupName = $vm.ResourceGroupName
+                    VMName            = $vm.Name
+                    Location          = $vm.Location
+                    VMSize            = $vm.HardwareProfile.VmSize
+                    PowerState        = $powerState
+                    AverageCpuPct     = $null
+                    PeakCpuPct        = $null
+                    SampleCount       = 0
+                    Status            = "Skipped"
+                    Error             = "VM not running"
+                })
+
+                continue
+            }
+
+            Write-Host ("  Processing {0}..." -f $vm.Name) -ForegroundColor Green
+
+            try {
+                $stats = Get-OverallCpuStats `
+                    -ResourceId $vm.Id `
+                    -StartTimeUtc $window.StartUtc `
+                    -EndTimeUtc $window.EndUtc
+
+                $results.Add([PSCustomObject]@{
+                    Month             = $window.Label
+                    SubscriptionName  = $sub.Name
+                    SubscriptionId    = $sub.Id
+                    ResourceGroupName = $vm.ResourceGroupName
+                    VMName            = $vm.Name
+                    Location          = $vm.Location
+                    VMSize            = $vm.HardwareProfile.VmSize
+                    PowerState        = $powerState
+                    AverageCpuPct     = $stats.AverageCpu
+                    PeakCpuPct        = $stats.PeakCpu
+                    SampleCount       = $stats.Samples
+                    Status            = "OK"
+                    Error             = $null
+                })
+            }
+            catch {
+                $results.Add([PSCustomObject]@{
+                    Month             = $window.Label
+                    SubscriptionName  = $sub.Name
+                    SubscriptionId    = $sub.Id
+                    ResourceGroupName = $vm.ResourceGroupName
+                    VMName            = $vm.Name
+                    Location          = $vm.Location
+                    VMSize            = $vm.HardwareProfile.VmSize
+                    PowerState        = $powerState
+                    AverageCpuPct     = $null
+                    PeakCpuPct        = $null
+                    SampleCount       = 0
+                    Status            = "Failed"
+                    Error             = $_.Exception.Message
+                })
+
+                Write-Warning ("Failed to process {0}: {1}" -f $vm.Name, $_.Exception.Message)
+            }
         }
     }
 
-    $results |
-        Sort-Object SubscriptionId, ResourceGroupName, VMName |
-        Tee-Object -Variable finalResults |
-        Format-Table -AutoSize
+    $finalResults = $results | Sort-Object SubscriptionName, ResourceGroupName, VMName
+
+    $finalResults | Format-Table -AutoSize
 
     $finalResults |
         Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 
     Write-Host ""
-    Write-Host "Report exported to: $OutputCsv" -ForegroundColor Green
+    Write-Host ("Report exported to: {0}" -f (Resolve-Path -LiteralPath $OutputCsv)) -ForegroundColor Cyan
 }
 catch {
     Write-Error $_.Exception.Message

@@ -1,0 +1,14 @@
+PolicyResources
+| where type =~ 'Microsoft.PolicyInsights/PolicyStates'
+| extend complianceState = tostring(properties.complianceState)
+| where complianceState =~ 'NonCompliant'
+| extend
+    resourceId = tostring(properties.resourceId),
+    policyAssignmentName = tostring(properties.policyAssignmentName),
+    policyAssignmentScope = tostring(properties.policyAssignmentScope),
+    policyDefinitionName = tostring(properties.policyDefinitionName),
+    policyDefinitionReferenceId = tostring(properties.policyDefinitionReferenceId),
+    timestamp = todatetime(properties.timestamp)
+| where policyAssignmentName startswith '{ASSIGNMENT_PREFIX}'
+| project timestamp, complianceState, policyAssignmentName, policyDefinitionName, policyDefinitionReferenceId, resourceId, policyAssignmentScope
+| order by timestamp desc
